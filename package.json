@@ -1,0 +1,18 @@
+{
+  "name": "naviable",
+  "version": "1.0.0",
+  "description": "NaviAble - Your intelligent navigation assistant with Next.js frontend and Flask backend",
+  "scripts": {
+    "dev": "concurrently \"npm run backend\" \"npm run frontend\"",
+    "backend": "cd . && source venv/bin/activate && python app.py",
+    "frontend": "cd frontend && npm run dev",
+    "install-all": "pip install -r requirements.txt && cd frontend && npm install",
+    "build": "cd frontend && npm run build"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  },
+  "keywords": ["naviable", "navigation", "assistant", "nextjs", "flask", "ai", "chat"],
+  "author": "",
+  "license": "MIT"
+} 
