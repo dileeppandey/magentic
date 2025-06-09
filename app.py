@@ -5,19 +5,33 @@ from flask_cors import CORS
 from models import db, Message
 from utils import enforce_role_alternation, flatten_messages
 from services import get_or_create_user, get_or_create_chat
-from magentic_ai import supervisor_agent, summary_chain, title_agent
+from agents import supervisor_agent, summary_chain, title_agent
 
 app = Flask(__name__)
 app.secret_key = os.getenv('FLASK_SECRET_KEY', 'your-secret-key-here')
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///naviable.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
+app.config['SESSION_COOKIE_SECURE'] = False  # Set to True in production with HTTPS
+app.config['SESSION_COOKIE_HTTPONLY'] = True
 
 # Configure CORS
 CORS(app, 
-     resources={r"/*": {"origins": ["http://localhost:3001"]}},
+     origins=["http://localhost:3001", "http://127.0.0.1:3001"],
      supports_credentials=True,
-     allow_headers=["Content-Type", "Authorization"],
-     methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"])
+     allow_headers=["Content-Type", "Authorization", "Accept"],
+     methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+     expose_headers=["Content-Type", "Authorization"],
+     max_age=600)
+
+# Add CORS headers to all responses
+@app.after_request
+def after_request(response):
+    response.headers.add('Access-Control-Allow-Origin', 'http://localhost:3001')
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization,Accept')
+    response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
+    response.headers.add('Access-Control-Allow-Credentials', 'true')
+    return response
 
 db.init_app(app)
 
@@ -28,36 +42,50 @@ with app.app_context():
 def index():
     return jsonify({'message': 'NaviAble API is running!', 'status': 'success', 'app': 'NaviAble - Your Intelligent Navigation Assistant'})
 
-@app.route('/chat', methods=['POST'])
+@app.route('/chat', methods=['POST', 'OPTIONS'])
 def chat():
+    if request.method == 'OPTIONS':
+        return '', 200
+        
     try:
         data = request.get_json()
         message = data.get('message', '').strip()
         if not message:
             return jsonify({'error': 'Message is required'}), 400
+            
         user = get_or_create_user()
         chat = get_or_create_chat(user, message, title_agent)
         if chat is None:
             return jsonify({'error': 'Chat not found or could not be created.'}), 400
+            
         # 1. Save the user's message
         user_message = Message(chat_id=chat.id, role='user', content=message)
         db.session.add(user_message)
         db.session.commit()
-        # 2. Reload the full message history (now includes the new user message)
+        
+        # 2. Reload the full message history
         api_messages = [{'role': msg.role, 'content': msg.content} for msg in chat.messages]
-        # 3. Generate assistant response using supervisor_agent from magentic-ai.py
+        
+        # 3. Generate assistant response
         response = supervisor_agent(api_messages)
         if hasattr(response, '__await__'):
             import asyncio
             response = asyncio.run(response)
+            
         history_text = flatten_messages(api_messages)
         summary_obj = summary_chain.run({'history': history_text})
         formatted_response = summary_obj.markdown
+        
         # 4. Save the assistant's message
         assistant_message = Message(chat_id=chat.id, role='assistant', content=formatted_response)
         db.session.add(assistant_message)
         db.session.commit()
-        return jsonify({'response': formatted_response, 'chat_id': chat.id})
+        
+        return jsonify({
+            'response': formatted_response, 
+            'chat_id': chat.id,
+            'timestamp': assistant_message.timestamp.strftime('%H:%M')
+        })
     except Exception as e:
         tb = traceback.format_exc()
         app.logger.error(f"Error in chat endpoint: {str(e)}\n{tb}")
@@ -142,4 +170,4 @@ def delete_chat(chat_id):
     return jsonify({'success': True})
 
 if __name__ == '__main__':
-    app.run(debug=True, port=5000) 
+    app.run(debug=True, port=8000) 
