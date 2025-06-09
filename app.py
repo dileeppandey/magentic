@@ -11,7 +11,14 @@ app = Flask(__name__)
 app.secret_key = os.getenv('FLASK_SECRET_KEY', 'your-secret-key-here')
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///naviable.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-CORS(app, supports_credentials=True)
+
+# Configure CORS
+CORS(app, 
+     resources={r"/*": {"origins": ["http://localhost:3001"]}},
+     supports_credentials=True,
+     allow_headers=["Content-Type", "Authorization"],
+     methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"])
+
 db.init_app(app)
 
 with app.app_context():
@@ -135,4 +142,4 @@ def delete_chat(chat_id):
     return jsonify({'success': True})
 
 if __name__ == '__main__':
-    app.run(debug=True) 
+    app.run(debug=True, port=5000) 

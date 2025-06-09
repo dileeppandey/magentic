@@ -4,23 +4,36 @@ from databricks_langchain import ChatDatabricks
 from databricks.sdk import WorkspaceClient
 import mlflow
 import json
-
+from typing import Optional, Any, Generator
 import os
-
+import asyncio
 from dotenv import load_dotenv
+from mlflow.types.agent import ChatAgentMessage
+from langgraph.graph import END, StateGraph
+from langgraph.graph.state import CompiledStateGraph
+from mlflow.langchain.chat_agent_langgraph import ChatAgentState
+from mlflow.pyfunc import ChatAgent
+from mlflow.types.agent import (
+    ChatAgentChunk,
+    ChatAgentMessage,
+    ChatAgentResponse,
+    ChatContext,
+)
+from pydantic import BaseModel
+from langchain_core.runnables import RunnableLambda
 
 mlflow.langchain.autolog()
-
 load_dotenv()
 
+# Initialize workspace client and environment variables
 w = WorkspaceClient()
-
 os.environ["DATABRICKS_HOST"] = w.config.host
 os.environ["DATABRICKS_TOKEN"] = w.tokens.create(comment="for model serving", lifetime_seconds=1200).token_value
 
+# Initialize LLM
 llm = ChatDatabricks(endpoint="databricks-meta-llama-3-3-70b-instruct")
 
-
+# Initialize MCP client
 client = MultiServerMCPClient({
     "nimble": {
         "url": "https://mcp.nimbleway.com/sse",
@@ -31,14 +44,8 @@ client = MultiServerMCPClient({
     }
 })
 
-# tools = await client.get_tools()
-# flight_agent = create_react_agent(llm, tools, prompt="""
-#         You are a flight agent. You are responsible for finding the best flights for the accessible or disable person. Analyze the user's requirements and the tool response and return a few of the best flight information.
-#     """)
-
-# COMMAND ----------
-
-flight_agent_prompt =  """You are a specialized flight booking assistant for travelers with accessibility needs.
+# Agent prompts
+flight_agent_prompt = """You are a specialized flight booking assistant for travelers with accessibility needs.
 Your goals:
 - Always recommend **non-stop round-trip flights**.
 - Include **flight numbers, airline names, departure/arrival times, and airports**.
@@ -48,11 +55,9 @@ Your goals:
 - Prioritize **morning departures**, **non-stop routes**, and major carriers.
 Example output:
 - American Airlines Flight 234: Departs BOS at 8:00 AM, arrives SAN at 11:35 AM. Wheelchair assistance available, priority boarding included. Economy: $525, Premium: $745.
-ALWAYS USE TOOLS. DO NOT RESPOND DIRECTLY. Give Detailed output. Do not skip anything
-    """
-flight_agent = create_react_agent(llm, tools, prompt=flight_agent_prompt)
+ALWAYS USE TOOLS. DO NOT RESPOND DIRECTLY. Give Detailed output. Do not skip anything"""
 
-lodging_agent_prompt =  """You are a specialized hotel search assistant for travelers with disabilities.
+lodging_agent_prompt = """You are a specialized hotel search assistant for travelers with disabilities.
 Your goals:
 - Always return **2–3 hotels** with full accessibility.
 - Include **room types** (roll-in shower, grab bars, lowered counters, visual fire alarms).
@@ -62,59 +67,22 @@ Your goals:
 - Emphasize best pick based on **proximity**, **cost**, and **accessibility score**.
 Example output:
 - Hyatt Regency San Diego: 4-star hotel, 10 min from airport, $225/night. Features include roll-in showers, elevators, hearing aids, and ADA shuttles.
-ALWAYS USE TOOLS. DO NOT RESPOND DIRECTLY.  Give Detailed output. Do no skip anything.
-    """
-lodging_agent = create_react_agent(llm, tools, prompt=lodging_agent_prompt)
+ALWAYS USE TOOLS. DO NOT RESPOND DIRECTLY.  Give Detailed output. Do no skip anything."""
 
-# COMMAND ----------
+# Initialize module-level variables
+tools = None
+flight_agent = None
+lodging_agent = None
+AGENT = None
 
-import functools
-import os
-from typing import Any, Generator, Literal, Optional
-
-import mlflow
-from databricks.sdk import WorkspaceClient
-from databricks_langchain import (
-    ChatDatabricks,
-    UCFunctionToolkit,
-)
-from databricks_langchain.genie import GenieAgent
-from langchain_core.runnables import RunnableLambda
-from langgraph.graph import END, StateGraph
-from langgraph.graph.state import CompiledStateGraph
-from langgraph.prebuilt import create_react_agent
-from mlflow.langchain.chat_agent_langgraph import ChatAgentState
-from mlflow.pyfunc import ChatAgent
-from mlflow.types.agent import (
-    ChatAgentChunk,
-    ChatAgentMessage,
-    ChatAgentResponse,
-    ChatContext,
-)
-from pydantic import BaseModel
-
-
-def parse_next_node(response: str) -> str:
-    try:
-        data = json.loads(response)
-        return data.get("next_node", "FINISH")
-    except Exception:
-        return "FINISH"
-
-# COMMAND ----------
-
-
-LLM_ENDPOINT_NAME = "databricks-meta-llama-3-3-70b-instruct"
-llm = ChatDatabricks(endpoint=LLM_ENDPOINT_NAME)
-
+# Agent descriptions and configuration
 flight_agent_description = (
-    "THe flight agent will fetch all flight information for you. Always ask for infromation considering asking person is either accessible or disable person.",
+    "The flight agent will fetch all flight information for you. Always ask for information considering asking person is either accessible or disable person.",
 )
 lodging_agent_description = (
-    "THe flight agent will fetch all lodging or hotel information for you. Always ask for infromation considering asking person is either accessible or disable person.",
+    "The lodging agent will fetch all lodging or hotel information for you. Always ask for information considering asking person is either accessible or disable person.",
 )
-# TODO update the max number of iterations between supervisor and worker nodes
-# before returning to the user
+
 MAX_ITERATIONS = 6
 
 worker_descriptions = {
@@ -146,114 +114,13 @@ Your job is to:
 - Always prioritize the most accessible options (wheelchair-friendly, visual/auditory aids, proximity to elevators, etc.).
 - If the request is unclear or not relevant to either, ask the user for clarification.
 Decide between routing between the following workers or ending the conversation if an answer is provided. \n{formatted_descriptions}"""
+
 options = ["FINISH"] + list(worker_descriptions.keys())
 FINISH = {"next_node": "FINISH"}
-
-def supervisor_agent(state):
-    count = state.get("iteration_count", 0) + 1
-    if count > MAX_ITERATIONS:
-        return FINISH
-    user_msg = next((m["content"] for m in state["messages"] if m["role"] == "user"), "")
-    if len(user_msg.strip().split()) < 3:
-        return {
-            "next_node": "FINISH",
-            "messages": [
-                {
-                    "role": "assistant",
-                    "content": "Welcome! I can help with booking **accessible flights and hotels**.\nPlease tell me:\n- Your travel dates\n- Destination\n- Any accessibility needs (e.g., wheelchair assistance)."
-                }
-            ]
-        }
-    preprocessor = RunnableLambda(
-        lambda state: [{"role": "system", "content": system_prompt}] + state["messages"]
-    )
-    supervisor_chain = preprocessor | llm | RunnableLambda(
-        lambda msg: parse_next_node(
-            msg if isinstance(msg, str)
-            else msg.content if hasattr(msg, "content")
-            else msg[0].content if isinstance(msg, list)
-            else ""
-        )
-    )
-    next_node = supervisor_chain.invoke(state)
-    if state.get("next_node") == next_node:
-        return FINISH
-    return {
-        "iteration_count": count,
-        "next_node": next_node
-    }
-
-#######################################
-# Define our multiagent graph structure
-#######################################
-
-
-def agent_node(state, agent, name):
-    static_prompts = {
-        "Flight-Agent": flight_agent_prompt,
-        "Lodging-Agent": lodging_agent_prompt,
-    }
-    updated_messages = [
-        {"role": "system", "content": static_prompts[name]}
-    ] + state["messages"]
-    updated_messages = [{"role": "system", "content": static_prompts[name]}] + state["messages"]
-    result = agent.invoke({"messages": updated_messages})
-    return {
-        "messages": [
-            {
-                "role": "assistant",
-                "content": result["messages"][-1].content,
-                "name": name,
-            }
-        ]
-    }
-
-
-def final_answer(state):
-    prompt = (
-    "Summarize the travel plan based on the assistant messages. "
-    "Include full details: flight times, prices, assistance available, hotel amenities, accessibility features, and proximity to landmarks. "
-    "Use bullet points or sections for readability. Avoid generic tips."
-)
-    preprocessor = RunnableLambda(
-        lambda state: state["messages"] + [{"role": "user", "content": prompt}]
-    )
-    final_answer_chain = preprocessor | llm
-    return {"messages": [final_answer_chain.invoke(state)]}
-
 
 class AgentState(ChatAgentState):
     next_node: str
     iteration_count: int
-
-
-code_node = functools.partial(agent_node, agent=flight_agent, name="Flight-Agent")
-genie_node = functools.partial(agent_node, agent=lodging_agent, name="Lodging-Agent")
-
-workflow = StateGraph(AgentState)
-workflow.add_node("Flight-Agent", flight_agent)
-workflow.add_node("Lodging-Agent", lodging_agent)
-workflow.add_node("supervisor", supervisor_agent)
-workflow.add_node("final_answer", final_answer)
-
-workflow.set_entry_point("supervisor")
-# We want our workers to ALWAYS "report back" to the supervisor when done
-for worker in worker_descriptions.keys():
-    workflow.add_edge(worker, "supervisor")
-
-# Let the supervisor decide which next node to go
-workflow.add_conditional_edges(
-    "supervisor",
-    lambda x: x["next_node"],
-    {**{k: k for k in worker_descriptions.keys()}, "FINISH": "final_answer"},
-)
-workflow.add_edge("final_answer", END)
-multi_agent = workflow.compile()
-
-###################################
-# Wrap our multi-agent in ChatAgent
-###################################
-
 
 class LangGraphChatAgent(ChatAgent):
     def __init__(self, agent: CompiledStateGraph):
@@ -293,41 +160,115 @@ class LangGraphChatAgent(ChatAgent):
                     for msg in node_data.get("messages", [])
                 )
 
+def parse_next_node(response: str) -> str:
+    try:
+        data = json.loads(response)
+        return data.get("next_node", "FINISH")
+    except Exception:
+        return "FINISH"
 
-# Create the agent object, and specify it as the agent object to use when
-# loading the agent back for inference via mlflow.models.set_model()
-mlflow.langchain.autolog()
-AGENT = LangGraphChatAgent(multi_agent)
-mlflow.models.set_model(AGENT)
-
-# COMMAND ----------
-
-multi_agent
-
-# COMMAND ----------
-
-input_example = {
-    "messages": [
-        {
-            "role": "user",
-            "content": """I am accessible person and I'm planning a trip from Boston to San Diego from August 12th to August 20th. Can you help with both the flight and hotel parts of this trip?"""
+def supervisor_agent(state):
+    count = state.get("iteration_count", 0) + 1
+    if count > MAX_ITERATIONS:
+        return FINISH
+    user_msg = next((m["content"] for m in state["messages"] if m["role"] == "user"), "")
+    if len(user_msg.strip().split()) < 3:
+        return {
+            "next_node": "FINISH",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": "Welcome! I can help with booking **accessible flights and hotels**.\nPlease tell me:\n- Your travel dates\n- Destination\n- Any accessibility needs (e.g., wheelchair assistance)."
+                }
+            ]
         }
-    ]
-}
-resp = AGENT.predict(input_example)
+    preprocessor = RunnableLambda(
+        lambda state: [{"role": "system", "content": system_prompt}] + state["messages"]
+    )
+    supervisor_chain = preprocessor | llm | RunnableLambda(
+        lambda msg: parse_next_node(
+            msg if isinstance(msg, str)
+            else msg.content if hasattr(msg, "content")
+            else msg[0].content if isinstance(msg, list)
+            else ""
+        )
+    )
+    next_node = supervisor_chain.invoke(state)
+    if state.get("next_node") == next_node:
+        return FINISH
+    return {
+        "iteration_count": count,
+        "next_node": next_node
+    }
 
-# COMMAND ----------
+def agent_node(state, agent, name):
+    static_prompts = {
+        "Flight-Agent": flight_agent_prompt,
+        "Lodging-Agent": lodging_agent_prompt,
+    }
+    updated_messages = [
+        {"role": "system", "content": static_prompts[name]}
+    ] + state["messages"]
+    result = agent.invoke({"messages": updated_messages})
+    return {
+        "messages": [
+            {
+                "role": "assistant",
+                "content": result["messages"][-1].content,
+                "name": name,
+            }
+        ]
+    }
 
-print(resp.messages[-1].content)
+def final_answer(state):
+    prompt = (
+        "Summarize the travel plan based on the assistant messages. "
+        "Include full details: flight times, prices, assistance available, hotel amenities, accessibility features, and proximity to landmarks. "
+        "Use bullet points or sections for readability. Avoid generic tips."
+    )
+    preprocessor = RunnableLambda(
+        lambda state: state["messages"] + [{"role": "user", "content": prompt}]
+    )
+    final_answer_chain = preprocessor | llm
+    return {"messages": [final_answer_chain.invoke(state)]}
 
-# COMMAND ----------
+async def initialize_agents():
+    """Initialize all agents and tools asynchronously"""
+    global tools, flight_agent, lodging_agent, AGENT
+    
+    # Get tools
+    tools = await client.get_tools()
+    
+    # Create agents
+    flight_agent = create_react_agent(llm, tools, prompt=flight_agent_prompt)
+    lodging_agent = create_react_agent(llm, tools, prompt=lodging_agent_prompt)
+    
+    # Create and compile workflow
+    workflow = StateGraph(AgentState)
+    workflow.add_node("Flight-Agent", flight_agent)
+    workflow.add_node("Lodging-Agent", lodging_agent)
+    workflow.add_node("supervisor", supervisor_agent)
+    workflow.add_node("final_answer", final_answer)
+    
+    workflow.set_entry_point("supervisor")
+    for worker in worker_descriptions.keys():
+        workflow.add_edge(worker, "supervisor")
+    
+    workflow.add_conditional_edges(
+        "supervisor",
+        lambda x: x["next_node"],
+        {**{k: k for k in worker_descriptions.keys()}, "FINISH": "final_answer"},
+    )
+    workflow.add_edge("final_answer", END)
+    
+    multi_agent = workflow.compile()
+    AGENT = LangGraphChatAgent(multi_agent)
 
-# --- Flask-compatible supervisor_agent for app.py ---
+# Initialize agents at module level
+asyncio.run(initialize_agents())
+
 def supervisor_agent(messages):
-    """
-    Accepts a list of dicts: [{'role': 'user'/'assistant', 'content': ...}, ...]
-    Returns the last assistant message's content as {'content': ...}
-    """
+    """Flask-compatible supervisor agent that accepts a list of message dicts"""
     chat_msgs = [ChatAgentMessage(role=m['role'], content=m['content']) for m in messages]
     resp = AGENT.predict(chat_msgs)
     for msg in reversed(resp.messages):
@@ -344,7 +285,7 @@ import asyncio
 
 # --- Load secrets from .env ---
 load_dotenv()
-NIMBLE_KEY = os.getenv("NIMBLE_KEY")
+NIMBLE_API_KEY = os.getenv("NIMBLE_API_KEY")
 DATABRICKS_HOST = os.getenv("DATABRICKS_HOST")
 DATABRICKS_TOKEN = os.getenv("DATABRICKS_TOKEN")
 
@@ -362,7 +303,7 @@ async def setup_agents():
         "nimble": {
             "url": "https://mcp.nimbleway.com/sse",
             "transport": "sse",
-            "headers": {"Authorization": f"Bearer {NIMBLE_KEY}"}
+            "headers": {"Authorization": f"Bearer {NIMBLE_API_KEY}"}
         }
     })
     tools = await client.get_tools()
